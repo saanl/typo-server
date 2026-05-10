@@ -1,0 +1,9 @@
+services:
+  typonote:
+    build: .
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./uploads:/app/uploads
+      - ./typonote.db:/app/typonote.db
+    restart: unless-stopped
