@@ -20,10 +20,11 @@ import (
 // ---- model ----
 
 type Note struct {
-	ID        string `json:"id"`
-	Title     string `json:"title"`
-	Content   string `json:"content"`
-	UpdatedAt int64  `json:"updatedAt"`
+	ID        string   `json:"id"`
+	Title     string   `json:"title"`
+	Content   string   `json:"content"`
+	Tags      []string `json:"tags"`
+	UpdatedAt int64    `json:"updatedAt"`
 }
 
 // ---- store ----
@@ -43,11 +44,14 @@ func NewStore(path string) (*Store, error) {
 		id         TEXT PRIMARY KEY,
 		title      TEXT NOT NULL DEFAULT 'Untitled',
 		content    TEXT NOT NULL DEFAULT '',
+		tags       TEXT NOT NULL DEFAULT '[]',
 		updated_at INTEGER NOT NULL DEFAULT 0
 	)`)
 	if err != nil {
 		return nil, err
 	}
+	// migration: add tags column to existing databases
+	db.Exec(`ALTER TABLE notes ADD COLUMN tags TEXT NOT NULL DEFAULT '[]'`)
 	return &Store{db: db}, nil
 }
 
@@ -55,8 +59,39 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
-func (s *Store) List() ([]Note, error) {
-	rows, err := s.db.Query("SELECT id, title, content, updated_at FROM notes ORDER BY updated_at DESC")
+func scanNoteRow(s scanner, n *Note) error {
+	var tagsJSON string
+	err := s.Scan(&n.ID, &n.Title, &n.Content, &tagsJSON, &n.UpdatedAt)
+	if err != nil {
+		return err
+	}
+	json.Unmarshal([]byte(tagsJSON), &n.Tags)
+	if n.Tags == nil {
+		n.Tags = []string{}
+	}
+	return nil
+}
+
+type scanner interface {
+	Scan(dest ...interface{}) error
+}
+
+func marshalTags(tags []string) string {
+	if tags == nil {
+		return "[]"
+	}
+	data, _ := json.Marshal(tags)
+	return string(data)
+}
+
+func (s *Store) List(tag string) ([]Note, error) {
+	var rows *sql.Rows
+	var err error
+	if tag == "" {
+		rows, err = s.db.Query("SELECT id, title, content, tags, updated_at FROM notes ORDER BY updated_at DESC")
+	} else {
+		rows, err = s.db.Query("SELECT id, title, content, tags, updated_at FROM notes WHERE tags LIKE ? ORDER BY updated_at DESC", `%"`+tag+`"%`)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -65,7 +100,7 @@ func (s *Store) List() ([]Note, error) {
 	notes := make([]Note, 0)
 	for rows.Next() {
 		var n Note
-		if err := rows.Scan(&n.ID, &n.Title, &n.Content, &n.UpdatedAt); err != nil {
+		if err := scanNoteRow(rows, &n); err != nil {
 			return nil, err
 		}
 		notes = append(notes, n)
@@ -75,8 +110,7 @@ func (s *Store) List() ([]Note, error) {
 
 func (s *Store) Get(id string) (*Note, error) {
 	var n Note
-	err := s.db.QueryRow("SELECT id, title, content, updated_at FROM notes WHERE id = ?", id).
-		Scan(&n.ID, &n.Title, &n.Content, &n.UpdatedAt)
+	err := scanNoteRow(s.db.QueryRow("SELECT id, title, content, tags, updated_at FROM notes WHERE id = ?", id), &n)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -87,16 +121,16 @@ func (s *Store) Get(id string) (*Note, error) {
 }
 
 func (s *Store) Create(note Note) error {
-	_, err := s.db.Exec("INSERT INTO notes (id, title, content, updated_at) VALUES (?, ?, ?, ?)",
-		note.ID, note.Title, note.Content, note.UpdatedAt)
+	_, err := s.db.Exec("INSERT INTO notes (id, title, content, tags, updated_at) VALUES (?, ?, ?, ?, ?)",
+		note.ID, note.Title, note.Content, marshalTags(note.Tags), note.UpdatedAt)
 	return err
 }
 
-func (s *Store) Update(id, content string) (*Note, error) {
+func (s *Store) Update(id, content string, tags []string) (*Note, error) {
 	title := extractTitle(content)
 	now := time.Now().UnixMilli()
-	res, err := s.db.Exec("UPDATE notes SET content = ?, title = ?, updated_at = ? WHERE id = ?",
-		content, title, now, id)
+	res, err := s.db.Exec("UPDATE notes SET content = ?, title = ?, tags = ?, updated_at = ? WHERE id = ?",
+		content, title, marshalTags(tags), now, id)
 	if err != nil {
 		return nil, err
 	}
@@ -104,7 +138,7 @@ func (s *Store) Update(id, content string) (*Note, error) {
 	if n == 0 {
 		return nil, sql.ErrNoRows
 	}
-	return &Note{ID: id, Title: title, Content: content, UpdatedAt: now}, nil
+	return &Note{ID: id, Title: title, Content: content, Tags: tags, UpdatedAt: now}, nil
 }
 
 func (s *Store) Delete(id string) error {
@@ -194,7 +228,7 @@ func cors(next http.Handler) http.Handler {
 func handleNotes(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		listNotes(w)
+		listNotes(w, r)
 	case http.MethodPost:
 		createNote(w, r)
 	default:
@@ -216,8 +250,8 @@ func handleNoteByID(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func listNotes(w http.ResponseWriter) {
-	notes, err := store.List()
+func listNotes(w http.ResponseWriter, r *http.Request) {
+	notes, err := store.List(r.URL.Query().Get("tag"))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -240,7 +274,8 @@ func getNote(w http.ResponseWriter, id string) {
 
 func createNote(w http.ResponseWriter, r *http.Request) {
 	var input struct {
-		Content string `json:"content"`
+		Content string   `json:"content"`
+		Tags    []string `json:"tags"`
 	}
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -257,6 +292,7 @@ func createNote(w http.ResponseWriter, r *http.Request) {
 		ID:        generateID(),
 		Title:     extractTitle(input.Content),
 		Content:   input.Content,
+		Tags:      input.Tags,
 		UpdatedAt: time.Now().UnixMilli(),
 	}
 	if err := store.Create(note); err != nil {
@@ -268,7 +304,8 @@ func createNote(w http.ResponseWriter, r *http.Request) {
 
 func updateNote(w http.ResponseWriter, r *http.Request, id string) {
 	var input struct {
-		Content string `json:"content"`
+		Content string   `json:"content"`
+		Tags    []string `json:"tags"`
 	}
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -279,7 +316,7 @@ func updateNote(w http.ResponseWriter, r *http.Request, id string) {
 		http.Error(w, "bad json", http.StatusBadRequest)
 		return
 	}
-	note, err := store.Update(id, input.Content)
+	note, err := store.Update(id, input.Content, input.Tags)
 	if err == sql.ErrNoRows {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
